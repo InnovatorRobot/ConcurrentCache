@@ -1,11 +1,11 @@
 #include <atomic>
 #include <chrono>
-#include <random>
-#include <thread>
-#include <vector>
-
 #include <gtest/gtest.h>
 #include <lru_ttl_cache_thread_safe.hpp>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -191,7 +191,7 @@ TEST(LruTtlCacheTest, ConcurrentPuts)
         });
     }
 
-    for (auto& thread : threads)
+    for (auto &thread : threads)
     {
         thread.join();
     }
@@ -248,7 +248,7 @@ TEST(LruTtlCacheTest, ConcurrentGetsAndPuts)
         });
     }
 
-    for (auto& thread : threads)
+    for (auto &thread : threads)
     {
         thread.join();
     }
@@ -281,7 +281,7 @@ TEST(LruTtlCacheTest, ConcurrentErases)
         });
     }
 
-    for (auto& thread : threads)
+    for (auto &thread : threads)
     {
         thread.join();
     }
@@ -352,7 +352,7 @@ TEST(LruTtlCacheTest, InvalidCapacity)
         LruTtlCacheThreadSafe<int, int> cache(0, 10s);
         FAIL() << "Expected std::invalid_argument exception";
     }
-    catch (std::invalid_argument const&)
+    catch (std::invalid_argument const &)
     {
         // Expected exception
     }
@@ -395,4 +395,121 @@ TEST(LruTtlCacheTest, RapidExpirationAndInsertion)
     // Most entries should have expired
     // Only recent ones should remain
     EXPECT_LE(cache.size(), 5);
+}
+
+TEST(LruTtlCacheTest, StatsCounters)
+{
+    LruTtlCacheThreadSafe<int, int> cache(2, 10s);
+
+    cache.put(1, 10);
+    cache.put(2, 20);
+
+    EXPECT_TRUE(cache.get(1).has_value());    // hit
+    EXPECT_FALSE(cache.get(99).has_value());  // miss
+    cache.put(3, 30);                         // evicts LRU (key 2)
+    EXPECT_FALSE(cache.get(2).has_value());   // miss (evicted)
+
+    auto const s = cache.stats();
+    EXPECT_EQ(s.hits, 1u);
+    EXPECT_EQ(s.misses, 2u);
+    EXPECT_EQ(s.evictions, 1u);
+
+    cache.resetStats();
+    auto const s2 = cache.stats();
+    EXPECT_EQ(s2.hits, 0u);
+    EXPECT_EQ(s2.misses, 0u);
+    EXPECT_EQ(s2.evictions, 0u);
+    EXPECT_EQ(s2.expirations, 0u);
+}
+
+TEST(LruTtlCacheTest, PeekDoesNotUpdateLru)
+{
+    LruTtlCacheThreadSafe<int, std::string> cache(3, 10s);
+
+    cache.put(1, "one");
+    cache.put(2, "two");
+    cache.put(3, "three");
+
+    // peek 1: must NOT promote it, so 1 stays the LRU victim.
+    auto val = cache.peek(1);
+    ASSERT_TRUE(val.has_value());
+    EXPECT_EQ(*val, "one");
+
+    cache.put(4, "four");  // should evict 1 (still LRU)
+
+    EXPECT_FALSE(cache.contains(1));
+    EXPECT_TRUE(cache.contains(2));
+    EXPECT_TRUE(cache.contains(3));
+    EXPECT_TRUE(cache.contains(4));
+}
+
+TEST(LruTtlCacheTest, ContainsRespectsExpiration)
+{
+    LruTtlCacheThreadSafe<int, int> cache(10, 100ms);
+
+    cache.put(1, 1);
+    EXPECT_TRUE(cache.contains(1));
+
+    std::this_thread::sleep_for(150ms);
+    EXPECT_FALSE(cache.contains(1));
+    EXPECT_EQ(cache.size(), 0u);
+}
+
+struct Point
+{
+    int x{0};
+    int y{0};
+    bool operator==(Point const &other) const { return x == other.x && y == other.y; }
+};
+
+struct PointHash
+{
+    std::size_t operator()(Point const &p) const noexcept
+    {
+        return std::hash<int>{}(p.x) * 31u + std::hash<int>{}(p.y);
+    }
+};
+
+TEST(LruTtlCacheTest, CustomKeyTypeWithCustomHash)
+{
+    LruTtlCacheThreadSafe<Point, std::string, PointHash> cache(10, 10s);
+
+    cache.put(Point{1, 2}, "a");
+    cache.put(Point{3, 4}, "b");
+
+    auto a = cache.get(Point{1, 2});
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(*a, "a");
+
+    EXPECT_FALSE(cache.get(Point{9, 9}).has_value());
+}
+
+struct NoDefault
+{
+    int v;
+    explicit NoDefault(int value) : v(value) {}
+};
+
+TEST(LruTtlCacheTest, NonDefaultConstructibleValue)
+{
+    LruTtlCacheThreadSafe<int, NoDefault> cache(4, 10s);
+
+    cache.put(1, NoDefault{42});
+    auto val = cache.get(1);
+    ASSERT_TRUE(val.has_value());
+    EXPECT_EQ(val->v, 42);
+}
+
+TEST(LruTtlCacheTest, BackgroundWorkerDisabled)
+{
+    // sweep_interval == 0 disables the worker; expiry is lazy on access.
+    LruTtlCacheThreadSafe<int, int> cache(
+        10, 50ms, LruTtlCacheThreadSafe<int, int>::Duration::zero());
+
+    cache.put(1, 1);
+    std::this_thread::sleep_for(80ms);
+
+    // Still counted until touched, then purged lazily.
+    EXPECT_FALSE(cache.get(1).has_value());
+    EXPECT_EQ(cache.size(), 0u);
 }

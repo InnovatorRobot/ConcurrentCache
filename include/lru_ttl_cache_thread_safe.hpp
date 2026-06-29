@@ -1,406 +1,405 @@
-#pragma once
+#ifndef LRU_TTL_CACHE_THREAD_SAFE_HPP
+#define LRU_TTL_CACHE_THREAD_SAFE_HPP
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <list>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
-#include <vector>
+#include <utility>
+
+#include "lru_ttl_cache/cache_node.hpp"
+#include "lru_ttl_cache/cache_stats.hpp"
+#include "lru_ttl_cache/intrusive_list.hpp"
 
 /**
- * @brief Thread-safe LRU cache with TTL (Time-To-Live) expiration
+ * @brief Thread-safe LRU cache with TTL (Time-To-Live) expiration.
  *
- * This cache maintains a fixed capacity and automatically evicts entries
- * based on both LRU (Least Recently Used) policy and TTL expiration.
- * A background worker thread periodically sweeps expired entries.
+ * The cache holds at most @p capacity entries. Entries are evicted either when
+ * the capacity is exceeded (least-recently-used victim) or when their TTL
+ * elapses. An optional background worker thread periodically purges expired
+ * entries so memory is reclaimed even without user traffic.
  *
- * @tparam K Key type (must be hashable and equality-comparable)
- * @tparam V Value type (must be copyable or movable)
+ * Design / performance
+ * --------------------
+ * Every entry lives exactly once inside an `std::unordered_map<K, Node>` (the
+ * map is node-based, so element addresses stay stable across rehashes). Each
+ * node is threaded through two intrusive doubly-linked lists (see
+ * lru_ttl_cache::detail::IntrusiveList):
+ *   - the LRU list (front = most-recently-used, back = least-recently-used);
+ *   - the expiry list, kept in ascending `expires_at` order.
+ *
+ * Because the TTL is constant for the cache and `get()` does not refresh it,
+ * newly inserted/updated entries always have the largest expiration time and
+ * are appended to the expiry tail. Purging therefore only walks the expiry
+ * *head* and stops at the first live entry — O(k) in the number of expired
+ * entries rather than O(n) over the whole cache. All hot-path operations
+ * (`put`, `get`, `erase`) are O(1) amortized with no per-call allocations
+ * beyond the single map node.
+ *
+ * Thread safety
+ * -------------
+ * Every public operation is serialized by a single mutex. Pointers stored in
+ * the intrusive lists remain valid for the lifetime of their map node.
+ *
+ * @tparam K        Key type (hashable via @p Hash, comparable via @p KeyEqual).
+ * @tparam V        Value type (copyable or movable).
+ * @tparam Hash     Hash functor for keys (defaults to std::hash<K>).
+ * @tparam KeyEqual Equality functor for keys (defaults to std::equal_to<K>).
  */
-template <typename K, typename V>
+template <typename K,
+          typename V,
+          typename Hash     = std::hash<K>,
+          typename KeyEqual = std::equal_to<K>>
 class LruTtlCacheThreadSafe
 {
- public:
+public:
     using Clock     = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
     using Duration  = Clock::duration;
 
-    /**
-     * @brief Internal node structure storing value, expiration time, and LRU
-     * position
-     */
-    struct Node
-    {
-        V value;
-        TimePoint expires_at;
-        typename std::list<K>::iterator it;  // position in LRU list
-    };
+    /// Snapshot of runtime counters (see lru_ttl_cache::CacheStats).
+    using Stats = lru_ttl_cache::CacheStats;
 
     /**
-     * @brief Construct a new thread-safe LRU TTL cache
+     * @brief Construct a thread-safe LRU+TTL cache.
      *
-     * @param capacity Maximum number of entries in the cache
-     * @param ttl Time-to-live duration for entries
-     * @param sweep_interval Interval between background cleanup sweeps
+     * @param capacity       Maximum number of live entries (must be > 0).
+     * @param ttl            Time-to-live applied to each entry (must be > 0).
+     * @param sweep_interval Background purge cadence. Pass `Duration::zero()`
+     *                       to disable the background worker entirely (expired
+     *                       entries are then reclaimed lazily on access).
+     *
+     * @throws std::invalid_argument if @p capacity is 0 or @p ttl is <= 0.
      */
     LruTtlCacheThreadSafe(std::size_t capacity,
                           Duration ttl,
                           Duration sweep_interval = std::chrono::seconds(1)) :
-        capacity_(capacity),
-        ttl_(ttl),
-        sweep_interval_(sweep_interval),
-        stop_{false}
+        capacity_{capacity}, ttl_{ttl}, sweep_interval_{sweep_interval}
     {
         if (capacity == 0)
         {
             throw std::invalid_argument("Capacity must be greater than 0");
         }
-        worker_ = std::thread([this] { this->workerLoop(); });
-    }
+        if (ttl <= Duration::zero())
+        {
+            throw std::invalid_argument("TTL must be greater than 0");
+        }
 
-    // no copy for simplicity
-    LruTtlCacheThreadSafe(LruTtlCacheThreadSafe const&)            = delete;
-    LruTtlCacheThreadSafe& operator=(LruTtlCacheThreadSafe const&) = delete;
+        map_.reserve(capacity_);
 
-    // Move constructor
-    LruTtlCacheThreadSafe(LruTtlCacheThreadSafe&& other) noexcept :
-        capacity_(other.capacity_),
-        ttl_(other.ttl_),
-        sweep_interval_(other.sweep_interval_),
-        lru_(std::move(other.lru_)),
-        map_(std::move(other.map_)),
-        stop_(other.stop_.load())
-    {
-        // Worker thread cannot be moved, so we need to start a new one
-        if (!stop_.load())
+        if (sweep_interval_ > Duration::zero())
         {
             worker_ = std::thread([this] { this->workerLoop(); });
         }
     }
 
-    // Move assignment
-    LruTtlCacheThreadSafe& operator=(LruTtlCacheThreadSafe&& other) noexcept
-    {
-        if (this != &other)
-        {
-            // Stop current worker
-            stop_.store(true, std::memory_order_release);
-            {
-                std::lock_guard<std::mutex> lk(cv_mutex_);
-                cv_.notify_all();
-            }
-            if (worker_.joinable())
-                worker_.join();
-
-            // Move data
-            capacity_       = other.capacity_;
-            ttl_            = other.ttl_;
-            sweep_interval_ = other.sweep_interval_;
-            lru_            = std::move(other.lru_);
-            map_            = std::move(other.map_);
-            stop_           = other.stop_.load();
-
-            // Start new worker if needed
-            if (!stop_.load())
-            {
-                worker_ = std::thread([this] { this->workerLoop(); });
-            }
-        }
-        return *this;
-    }
+    // Owning a background thread makes copying and moving unsafe; disable both.
+    LruTtlCacheThreadSafe(LruTtlCacheThreadSafe const &)            = delete;
+    LruTtlCacheThreadSafe &operator=(LruTtlCacheThreadSafe const &) = delete;
+    LruTtlCacheThreadSafe(LruTtlCacheThreadSafe &&)                 = delete;
+    LruTtlCacheThreadSafe &operator=(LruTtlCacheThreadSafe &&)      = delete;
 
     /**
-     * @brief Destructor - stops background worker thread
+     * @brief Stop the background worker and release all entries.
      */
     ~LruTtlCacheThreadSafe()
     {
-        // signal worker to stop
         stop_.store(true, std::memory_order_release);
         {
-            std::lock_guard<std::mutex> lk(cv_mutex_);
+            std::lock_guard<std::mutex> lk{cv_mutex_};
             cv_.notify_all();
         }
         if (worker_.joinable())
+        {
             worker_.join();
-    }
-
-    // --------- put ---------
-
-    /**
-     * @brief Insert or update a key-value pair in the cache
-     *
-     * @param key The key
-     * @param value The value
-     */
-    void put(K const& key, V const& value)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto now = Clock::now();
-
-        auto m_it = map_.find(key);
-        if (m_it != map_.end())
-        {
-            // update existing
-            auto& node      = m_it->second;
-            node.value      = value;
-            node.expires_at = now + ttl_;
-            // move key to front
-            lru_.splice(lru_.begin(), lru_, node.it);
-            node.it = lru_.begin();
-            return;
         }
-
-        // ensure capacity (may also evict expired from tail)
-        evictIfNeededLocked(now);
-
-        // insert new
-        lru_.push_front(key);
-        Node node;
-        node.value      = value;
-        node.expires_at = now + ttl_;
-        node.it         = lru_.begin();
-        map_[key]       = std::move(node);
     }
 
-    /**
-     * @brief Insert or update a key-value pair using move semantics
-     *
-     * @param key The key
-     * @param value The value (will be moved)
-     */
-    void put(K const& key, V&& value)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto now = Clock::now();
-
-        auto m_it = map_.find(key);
-        if (m_it != map_.end())
-        {
-            // update existing
-            auto& node      = m_it->second;
-            node.value      = std::move(value);
-            node.expires_at = now + ttl_;
-            // move key to front
-            lru_.splice(lru_.begin(), lru_, node.it);
-            node.it = lru_.begin();
-            return;
-        }
-
-        // ensure capacity (may also evict expired from tail)
-        evictIfNeededLocked(now);
-
-        // insert new
-        lru_.push_front(key);
-        Node node;
-        node.value      = std::move(value);
-        node.expires_at = now + ttl_;
-        node.it         = lru_.begin();
-        map_[key]       = std::move(node);
-    }
-
-    // --------- get (optional-style) ---------
+    // --------------------------------------------------------------- put ---
 
     /**
-     * @brief Retrieve a value by key
-     *
-     * @param key The key to look up
-     * @return std::optional<V> The value if found and not expired, std::nullopt
-     * otherwise
+     * @brief Insert or update an entry (copying the value).
      */
-    std::optional<V> get(K const& key)
+    void put(K const &key, V const &value) { putImpl(key, value); }
+
+    /**
+     * @brief Insert or update an entry (moving the value).
+     */
+    void put(K const &key, V &&value) { putImpl(key, std::move(value)); }
+
+    // --------------------------------------------------------------- get ---
+
+    /**
+     * @brief Look up a key, refreshing its LRU position on a hit.
+     *
+     * @return The stored value if present and not expired, else std::nullopt.
+     */
+    std::optional<V> get(K const &key)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto m_it = map_.find(key);
-        if (m_it == map_.end())
-            return std::nullopt;
-
-        auto& node = m_it->second;
-        auto now   = Clock::now();
-
-        // expired → drop & report miss
-        if (node.expires_at <= now)
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto it = map_.find(key);
+        if (it == map_.end())
         {
-            eraseNodeLocked(m_it);
+            ++misses_;
             return std::nullopt;
         }
 
-        // refresh LRU: move to front
-        lru_.splice(lru_.begin(), lru_, node.it);
-        node.it = lru_.begin();
+        Node &node = it->second;
+        if (node.expires_at <= Clock::now())
+        {
+            ++expirations_;
+            ++misses_;
+            detachNodeLocked(it);
+            return std::nullopt;
+        }
 
+        lru_.moveToFront(&node);
+        ++hits_;
         return node.value;
     }
 
-    // --------- erase / misc ---------
+    /**
+     * @brief Look up a key without affecting its LRU position.
+     *
+     * Useful for read-only inspection that must not promote the entry.
+     *
+     * @return The stored value if present and not expired, else std::nullopt.
+     */
+    std::optional<V> peek(K const &key)
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto it = map_.find(key);
+        if (it == map_.end())
+        {
+            ++misses_;
+            return std::nullopt;
+        }
+
+        Node &node = it->second;
+        if (node.expires_at <= Clock::now())
+        {
+            ++expirations_;
+            ++misses_;
+            detachNodeLocked(it);
+            return std::nullopt;
+        }
+
+        ++hits_;
+        return node.value;
+    }
 
     /**
-     * @brief Remove a key-value pair from the cache
+     * @brief Test whether a live (non-expired) entry exists for @p key.
      *
-     * @param key The key to remove
-     * @return true if the key was found and removed, false otherwise
+     * Does not update the LRU position. Expired entries are purged on contact.
      */
-    bool erase(K const& key)
+    bool contains(K const &key)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto m_it = map_.find(key);
-        if (m_it == map_.end())
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto it = map_.find(key);
+        if (it == map_.end())
+        {
             return false;
-        eraseNodeLocked(m_it);
+        }
+        if (it->second.expires_at <= Clock::now())
+        {
+            ++expirations_;
+            detachNodeLocked(it);
+            return false;
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------- erase / misc ---
+
+    /**
+     * @brief Remove an entry by key.
+     *
+     * @return true if a (live or expired) entry was removed, false otherwise.
+     */
+    bool erase(K const &key)
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto it = map_.find(key);
+        if (it == map_.end())
+        {
+            return false;
+        }
+        detachNodeLocked(it);
         return true;
     }
 
     /**
-     * @brief Clear all entries from the cache
+     * @brief Remove all entries.
      */
     void clear()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock{mutex_};
         map_.clear();
         lru_.clear();
+        exp_.clear();
     }
 
     /**
-     * @brief Get the current number of entries in the cache
-     *
-     * @return std::size_t Number of entries
+     * @brief Current number of stored entries (may include not-yet-purged
+     *        expired entries until the next access or sweep).
      */
     std::size_t size() const
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock{mutex_};
         return map_.size();
     }
 
     /**
-     * @brief Check if the cache is empty
-     *
-     * @return true if empty, false otherwise
+     * @brief Whether the cache currently holds no entries.
      */
     bool empty() const
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock{mutex_};
         return map_.empty();
     }
 
     /**
-     * @brief Get the maximum capacity of the cache
-     *
-     * @return std::size_t Maximum capacity
+     * @brief Maximum number of live entries.
      */
     std::size_t capacity() const noexcept { return capacity_; }
 
     /**
-     * @brief Get the TTL duration
-     *
-     * @return Duration TTL duration
+     * @brief Configured time-to-live.
      */
     Duration ttl() const noexcept { return ttl_; }
 
- private:
-    using Map   = std::unordered_map<K, Node>;
-    using List  = std::list<K>;
-    using MapIt = typename Map::iterator;
+    /**
+     * @brief Snapshot of the runtime counters.
+     */
+    Stats stats() const
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return Stats{hits_, misses_, evictions_, expirations_};
+    }
 
-    // --------- background worker ---------
+    /**
+     * @brief Reset all runtime counters to zero.
+     */
+    void resetStats()
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        hits_ = misses_ = evictions_ = expirations_ = 0;
+    }
+
+private:
+    using Node    = lru_ttl_cache::detail::CacheNode<K, V, TimePoint>;
+    using Map     = std::unordered_map<K, Node, Hash, KeyEqual>;
+    using LruList = lru_ttl_cache::detail::IntrusiveList<Node, &Node::lru_prev, &Node::lru_next>;
+    using ExpList = lru_ttl_cache::detail::IntrusiveList<Node, &Node::exp_prev, &Node::exp_next>;
+
+    // ---------------------------------------------------------- put impl ---
+    template <typename VV>
+    void putImpl(K const &key, VV &&value)
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        TimePoint const now = Clock::now();
+
+        auto it = map_.find(key);
+        if (it != map_.end())
+        {
+            Node &node      = it->second;
+            node.value      = std::forward<VV>(value);
+            node.expires_at = now + ttl_;
+            lru_.moveToFront(&node);
+            exp_.moveToBack(&node);
+            return;
+        }
+
+        // Reclaim space (expired first, then true LRU) before inserting.
+        evictIfNeededLocked(now);
+
+        auto res   = map_.try_emplace(key, std::forward<VV>(value), now + ttl_);
+        Node &node = res.first->second;
+        node.key   = &res.first->first;
+        lru_.pushFront(&node);
+        exp_.pushBack(&node);
+    }
+
+    // ----------------------------------------------------- background work ---
     void workerLoop()
     {
-        std::unique_lock<std::mutex> lk(cv_mutex_);
+        std::unique_lock<std::mutex> lk{cv_mutex_};
         while (!stop_.load(std::memory_order_acquire))
         {
-            // wait for sweep_interval_ or stop signal
-            cv_.wait_for(lk, sweep_interval_, [this] {
-                return stop_.load(std::memory_order_acquire);
-            });
+            cv_.wait_for(
+                lk, sweep_interval_, [this] { return stop_.load(std::memory_order_acquire); });
             if (stop_.load(std::memory_order_acquire))
+            {
                 break;
+            }
 
-            // do a cleanup pass
-            auto now = Clock::now();
-            std::lock_guard<std::mutex> data_lock(mutex_);
+            TimePoint const now = Clock::now();
+            std::lock_guard<std::mutex> data_lock{mutex_};
             purgeExpiredLocked(now);
         }
     }
 
-    // --------- internal helpers (must hold mutex_) ---------
+    // ------------------------------------------ helpers (require mutex_) ---
     void evictIfNeededLocked(TimePoint now)
     {
-        // first, drop expired ones from the back
         purgeExpiredLocked(now);
 
-        // if still over capacity, evict true LRU (back)
-        if (map_.size() >= capacity_ && !lru_.empty())
+        if (map_.size() >= capacity_ && lru_.tail() != nullptr)
         {
-            auto it_key = std::prev(lru_.end());
-            auto m_it   = map_.find(*it_key);
-            if (m_it != map_.end())
-                eraseNodeLocked(m_it);
+            Node *victim = lru_.tail();
+            ++evictions_;
+            detachNodeLocked(map_.find(*victim->key));
         }
     }
 
     void purgeExpiredLocked(TimePoint now)
     {
-        // iterate LRU from back (oldest) to front for efficiency
-        // Collect expired keys first to avoid iterator invalidation issues
-        std::vector<K> to_erase;
-        for (auto it = lru_.rbegin(); it != lru_.rend(); ++it)
+        // The expiry list is sorted ascending; stop at the first live entry.
+        while (exp_.head() != nullptr && exp_.head()->expires_at <= now)
         {
-            auto m_it = map_.find(*it);
-            if (m_it == map_.end())
-            {
-                // inconsistent state - will clean up below
-                to_erase.push_back(*it);
-                continue;
-            }
-            if (m_it->second.expires_at <= now)
-            {
-                to_erase.push_back(*it);
-            }
-        }
-        // Erase all expired/inconsistent entries
-        for (auto const& key : to_erase)
-        {
-            auto m_it = map_.find(key);
-            if (m_it != map_.end())
-            {
-                eraseNodeLocked(m_it);
-            }
-            else
-            {
-                // Inconsistent state - remove from list only
-                for (auto it = lru_.begin(); it != lru_.end(); ++it)
-                {
-                    if (*it == key)
-                    {
-                        lru_.erase(it);
-                        break;
-                    }
-                }
-            }
+            Node *victim = exp_.head();
+            ++expirations_;
+            detachNodeLocked(map_.find(*victim->key));
         }
     }
 
-    void eraseNodeLocked(MapIt m_it)
+    void detachNodeLocked(typename Map::iterator it)
     {
-        lru_.erase(m_it->second.it);
-        map_.erase(m_it);
+        Node *node = &it->second;
+        lru_.unlink(node);
+        exp_.unlink(node);
+        map_.erase(it);
     }
 
- private:
-    std::size_t capacity_;
-    Duration ttl_;
-    Duration sweep_interval_;
+private:
+    std::size_t const capacity_;
+    Duration const ttl_;
+    Duration const sweep_interval_;
 
-    List lru_;  // front = MRU, back = LRU
     Map map_;
+    LruList lru_;  // front = most-recently-used, back = least-recently-used
+    ExpList exp_;  // front = soonest to expire, back = latest to expire
 
-    mutable std::mutex mutex_;  // protects map_ + lru_
+    // Statistics (guarded by mutex_).
+    std::uint64_t hits_{0};
+    std::uint64_t misses_{0};
+    std::uint64_t evictions_{0};
+    std::uint64_t expirations_{0};
 
-    // worker control
+    mutable std::mutex mutex_;  // Protects map_ and the intrusive lists.
+
+    // Background worker control.
     std::thread worker_;
-    std::atomic<bool> stop_;
+    std::atomic<bool> stop_{false};
     std::condition_variable cv_;
     std::mutex cv_mutex_;
 };
+#endif  // LRU_TTL_CACHE_THREAD_SAFE_HPP

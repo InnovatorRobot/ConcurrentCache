@@ -6,6 +6,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(BUILD_TESTS "Build unit tests" ON)
+option(BUILD_BENCHMARKS "Build performance/memory benchmarks" ON)
+option(ENABLE_TSAN "Build with ThreadSanitizer (data-race analysis)" OFF)
+option(ENABLE_ASAN "Build with Address/UB Sanitizer (memory analysis)" OFF)
+
+find_package(Threads REQUIRED)
+
+if(ENABLE_TSAN)
+    message(STATUS "ThreadSanitizer enabled")
+    add_compile_options(-fsanitize=thread -g -O1)
+    add_link_options(-fsanitize=thread)
+endif()
+
+if(ENABLE_ASAN)
+    message(STATUS "Address/UB Sanitizer enabled")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
@@ -25,6 +42,11 @@ install(TARGETS lru_ttl_cache
 
 install(FILES include/lru_ttl_cache_thread_safe.hpp
     DESTINATION include
+)
+
+install(DIRECTORY include/lru_ttl_cache
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.hpp"
 )
 
 install(EXPORT lru_ttl_cacheTargets
@@ -58,5 +80,20 @@ if(BUILD_TESTS)
     )
     
     add_test(NAME LruTtlCacheTests COMMAND test_lru_ttl_cache)
+endif()
+
+if(BUILD_BENCHMARKS)
+    add_executable(cache_benchmark
+        benchmarks/benchmark_cache.cpp
+    )
+    target_link_libraries(cache_benchmark
+        PRIVATE
+        lru_ttl_cache
+        Threads::Threads
+    )
+    # Optimize the benchmark unless a sanitizer dictates its own flags.
+    if(NOT ENABLE_TSAN AND NOT ENABLE_ASAN)
+        target_compile_options(cache_benchmark PRIVATE -O2)
+    endif()
 endif()
 
