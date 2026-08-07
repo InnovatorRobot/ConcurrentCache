@@ -1,0 +1,13 @@
+operation,percentile,nanoseconds
+get,p50,127
+get,p90,227
+get,p95,277
+get,p99,452
+get,p999,1139
+get,max,138207
+put,p50,153
+put,p90,216
+put,p95,243
+put,p99,366
+put,p999,1115
+put,max,41741

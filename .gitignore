@@ -51,6 +51,3 @@ coverage/
 *.tmp
 *.log
 
-# Benchmark output (generated CSV/PNG)
-bench_results/
-
