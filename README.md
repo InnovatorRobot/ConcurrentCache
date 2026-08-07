@@ -1,6 +1,69 @@
 # Thread-Safe TTL LRU Cache
 
-A high-performance, thread-safe LRU (Least Recently Used) cache implementation with TTL (Time-To-Live) expiration support in C++17.
+> A header-only, high-performance **C++17 thread-safe LRU cache** with **TTL expiration**, a background sweeper, and built-in observability.
+
+![Language](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus)
+![Header-only](https://img.shields.io/badge/header--only-yes-brightgreen)
+![Build](https://img.shields.io/badge/build-CMake%203.14%2B-064F8C?logo=cmake)
+![Tests](https://img.shields.io/badge/tests-GoogleTest-green)
+![Sanitizers](https://img.shields.io/badge/checked-TSan%20%7C%20ASan-orange)
+
+The hot path (`get` / `put` / `erase`) is **O(1)** with no per-call allocations, and
+TTL reclamation is **O(k)** in the number of *expired* entries — never O(n) over the
+whole cache. On `<int64_t, int64_t>` it sustains **~9–12M ops/sec single-threaded**
+with **~127 ns p50 / 452 ns p99** lookups (see [Benchmarks](#benchmarks)).
+
+> **Demo:** *drop an animated terminal capture here* (e.g. recorded with [`vhs`](https://github.com/charmbracelet/vhs) or `asciinema` → `agg`):
+> `![demo](docs/demo.gif)`
+
+## Highlights
+
+| | |
+| --- | --- |
+| **O(1) hot path** | `get` / `put` / `erase` touch a handful of pointers; no allocation beyond one map node |
+| **O(k) expiry** | Constant TTL keeps the expiry list sorted, so purging walks only the expired prefix |
+| **Thread-safe** | Every operation serialized by one mutex; the background sweeper shares the same lock |
+| **TTL + LRU** | Entries leave on TTL elapse *or* LRU eviction at capacity — whichever comes first |
+| **Background cleanup** | Optional worker reclaims memory without user traffic; disable for purely lazy reclaim |
+| **Generic** | Templated on `<K, V, Hash, KeyEqual>` — any hashable key, any copyable/movable value |
+| **Observable** | Live hit / miss / eviction / expiration counters via `stats()` |
+| **Header-only** | One `#include`, no link step |
+
+## Architecture
+
+Each entry lives **once** in a node-based `std::unordered_map` (addresses stay stable
+across rehashes) and is threaded through **two intrusive doubly-linked lists** that share
+those nodes — one ordering by recency, one by expiry time.
+
+```mermaid
+flowchart LR
+    subgraph Map["std::unordered_map&lt;K, Node&gt;  (node-stable)"]
+        N1[Node A] & N2[Node B] & N3[Node C]
+    end
+    subgraph LRU["LRU list  (recency)"]
+        direction LR
+        MRU((MRU)) --> L1[A] --> L2[C] --> L3[B] --> LLRU((LRU victim))
+    end
+    subgraph EXP["Expiry list  (ascending expires_at)"]
+        direction LR
+        E0((soonest)) --> X1[B] --> X2[A] --> X3[C] --> E1((latest))
+    end
+    N1 -.-> L1 & X2
+    N2 -.-> L3 & X1
+    N3 -.-> L2 & X3
+```
+
+- **`get` hit** → move node to LRU front. **`put`** → append to expiry tail (largest `expires_at`), move to LRU front.
+- **Eviction** → drop the LRU list tail. **Expiry purge** → pop the expiry list head until the first live entry.
+
+### Complexity
+
+| Operation | Time | Allocations |
+| --- | --- | --- |
+| `get` / `peek` / `contains` | O(1) amortized | 0 |
+| `put` (insert or update) | O(1) amortized | ≤ 1 map node |
+| `erase` | O(1) amortized | 0 |
+| TTL purge (lazy or background) | O(k), k = expired entries | 0 |
 
 ## Features
 
@@ -123,39 +186,77 @@ cmake -DBUILD_TESTS=OFF ..
 cmake --build .
 ```
 
-## Benchmarks & Visualization
+## Benchmarks
 
 The project ships a self-contained benchmark that measures **throughput scaling,
 latency percentiles, memory footprint, and hit rate**, plus a Python script that
-renders charts from the results.
-
-### Run the benchmark
+renders the charts below.
 
 ```bash
 cmake -S . -B build && cmake --build build -j
-./build/cache_benchmark            # writes ./bench_results/*.csv
-```
-
-This produces four CSV files in `bench_results/`:
-
-| File             | What it measures                                              |
-| ---------------- | ------------------------------------------------------------ |
-| `throughput.csv` | Ops/sec vs thread count, at 50% and 95% read mixes           |
-| `latency.csv`    | `get` / `put` latency percentiles (p50–p99.9, max), in ns    |
-| `memory.csv`     | Resident-set growth and bytes-per-entry vs entry count       |
-| `hitrate.csv`    | Hit rate vs capacity under a Zipf-skewed (s=1.0) workload    |
-
-Building the benchmark is controlled by `-DBUILD_BENCHMARKS=ON` (default on).
-
-### Generate charts
-
-```bash
+./build/cache_benchmark                       # writes ./bench_results/*.csv
 pip install matplotlib
-python3 scripts/visualize.py bench_results   # writes ./bench_results/*.png
+python3 scripts/visualize.py bench_results    # writes ./bench_results/*.png
 ```
 
-This renders `throughput.png` (throughput + scalability vs ideal linear),
-`latency.png`, `memory.png`, and `hitrate.png`.
+> Numbers below were measured with `<int64_t, int64_t>` on a multi-core Linux
+> machine. **Your figures will vary** — re-run the harness to reproduce them locally.
+
+### Latency (single thread)
+
+`get` and `put` on a warm 100k-entry cache, 500k sampled operations each.
+
+![Latency percentiles](bench_results/latency.png)
+
+| Operation | p50 | p90 | p95 | p99 | p99.9 |
+| --------- | ---: | ---: | ---: | ---: | -----: |
+| `get` | 127 ns | 227 ns | 277 ns | 452 ns | 1.14 µs |
+| `put` | 153 ns | 216 ns | 243 ns | 366 ns | 1.12 µs |
+
+### Throughput & scalability
+
+Mixed `get`/`put` workload over a 100k-entry cache, at 50% and 95% read mixes.
+
+![Throughput scaling](bench_results/throughput.png)
+
+| Threads | 50% reads | 95% reads |
+| ------- | ---------: | ---------: |
+| 1 | 8.7M ops/s | 12.5M ops/s |
+| 2 | 2.6M ops/s | 3.9M ops/s |
+| 8 | 1.8M ops/s | 2.7M ops/s |
+| 64 | 1.2M ops/s | 0.9M ops/s |
+
+Throughput **peaks single-threaded**: the single global mutex means additional
+threads contend on one lock rather than scale. This is a deliberate
+simplicity/correctness trade-off — see [Concurrency & limitations](#concurrency--limitations)
+for the sharding mitigation.
+
+### Memory
+
+Resident-set growth vs. entry count; the intrusive-list design keeps overhead flat.
+
+![Memory footprint](bench_results/memory.png)
+
+| Entries | RSS growth | Bytes/entry |
+| ------- | ----------: | -----------: |
+| 10k | 0.86 MB | 86.4 |
+| 100k | 8.84 MB | 88.4 |
+| 500k | 44.1 MB | 88.3 |
+
+**≈ 88 bytes/entry**, stable as the cache grows (node + map bucket overhead).
+
+### Hit rate
+
+Hit ratio vs. capacity under a Zipf-skewed (s = 1.0) key distribution.
+
+![Hit rate](bench_results/hitrate.png)
+
+| Capacity (% of key space) | Hit rate |
+| ------------------------- | --------: |
+| 1% | 50.7% |
+| 10% | 73.7% |
+| 25% | 83.7% |
+| 50% | 91.8% |
 
 ### Memory & data-race analysis (sanitizers)
 
@@ -175,15 +276,7 @@ For a heap-usage-over-time profile, run the benchmark under Valgrind Massif:
 valgrind --tool=massif ./build/cache_benchmark && ms_print massif.out.*
 ```
 
-### Indicative results
-
-Measured with `<int64_t, int64_t>` on a multi-core Linux machine (your numbers
-will vary):
-
-- **Latency**: `get` p50 ≈ 120 ns, p99 ≈ 335 ns; `put` p50 ≈ 148 ns
-- **Memory**: ≈ 88 bytes per entry (node + map bucket overhead)
-- **Throughput**: peaks single-threaded (~9–12M ops/s); the shared mutex means
-  added threads contend rather than scale — see *Limitations* below
+The benchmark is built by default; toggle it with `-DBUILD_BENCHMARKS=ON/OFF`.
 
 ## Design Details
 
@@ -225,20 +318,36 @@ When the cache reaches capacity:
 - All operations are atomic with respect to each other
 - The background worker thread safely cleans up expired entries
 
-## Limitations
+## Concurrency & limitations
 
-- **Single Mutex**: All operations share a single mutex, which may limit throughput under extreme contention. For very high concurrency, shard several caches by key hash.
-- **No TTL Refresh**: Calling `get()` does not extend the TTL of an entry (this is by design and keeps expiry purging O(k))
-- **Non-Copyable / Non-Movable**: The cache owns a background thread, so it is neither copyable nor movable. Wrap it in `std::unique_ptr` or `std::shared_ptr` if you need to relocate ownership.
+A single mutex guards the map and both intrusive lists, which makes correctness easy
+to reason about — the background sweeper simply takes the same lock. The trade-off is
+scalability:
+
+- **Single mutex**: All operations share one lock, so throughput does not scale with
+  threads under contention. For high concurrency, **shard N independent caches by
+  `hash(key) % N`**; each shard keeps the O(1)/O(k) guarantees while spreading lock
+  traffic. A relaxed/approximate LRU (CLOCK, sampled eviction) is the other common path.
+- **No TTL refresh on read**: `get()` does not extend an entry's TTL. This is
+  intentional — a constant TTL keeps the expiry list sorted, which is what makes
+  purging O(k) instead of O(n).
+- **Non-copyable / non-movable**: The cache owns a background thread, so it is neither
+  copyable nor movable. Wrap it in `std::unique_ptr` / `std::shared_ptr` to relocate ownership.
+
+## Roadmap
+
+- [ ] Sharded wrapper (`ShardedLruTtlCache<N>`) for lock-striped concurrency
+- [ ] Optional per-entry TTL override on `put`
+- [ ] `get_or_compute` (single-flight) to collapse duplicate misses
+- [ ] Pluggable clock for deterministic testing of expiry
+- [ ] CI matrix (GCC/Clang/MSVC) with TSan/ASan gates
 
 ## License
 
-This project is provided as-is for educational and practical use.
+Provided as-is for educational and practical use. Add a `LICENSE` file (MIT is a
+common choice for header-only libraries) to set explicit terms before distribution.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
-
-## Author
-
-Created as a thread-safe, production-ready LRU cache with TTL support.
+Contributions are welcome — please open an issue or pull request. New behavior should
+ship with a Google Test case and stay clean under ThreadSanitizer and AddressSanitizer.
