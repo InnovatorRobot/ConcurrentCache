@@ -1,4 +1,4 @@
-# Thread-Safe TTL LRU Cache
+# Concurrent Cache
 
 > A header-only, high-performance **C++17 thread-safe LRU cache** with **TTL expiration**, a background sweeper, and built-in observability.
 
